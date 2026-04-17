@@ -1,42 +1,68 @@
 #!/bin/sh
-
 set -e
 
-echo "[+] Instalando pacotes..."
-apk update
-apk add openvpn easy-rsa iptables iptables-openrc curl
+BASE="/etc/openvpn"
+EASY="$BASE/easy-rsa"
+CLIENTS="$BASE/clients"
+PKI="$EASY/pki"
 
-# Detectar interface automaticamente
+mkdir -p "$CLIENTS"
+
+echo "[+] Detectando sistema..."
+
+# package manager
+if command -v apk >/dev/null; then PM="apk"
+elif command -v apt >/dev/null; then PM="apt"
+elif command -v dnf >/dev/null; then PM="dnf"
+elif command -v pacman >/dev/null; then PM="pacman"
+elif command -v xbps-install >/dev/null; then PM="xbps"
+else echo "[-] distro não suportada"; exit 1
+fi
+
+install() {
+case "$PM" in
+apk) apk add openvpn easy-rsa iptables curl qrencode ;;
+apt) apt update && apt install -y openvpn easy-rsa iptables nftables curl qrencode ;;
+dnf) dnf install -y openvpn easy-rsa iptables nftables curl qrencode ;;
+pacman) pacman -Sy --noconfirm openvpn easy-rsa iptables-nft curl qrencode ;;
+xbps) xbps-install -Sy openvpn easy-rsa iptables curl qrencode ;;
+esac
+}
+
+install
+
 IFACE=$(ip route | awk '/default/ {print $5; exit}')
 [ -z "$IFACE" ] && IFACE="eth0"
 
-# Detectar IP
-IP=$(curl -s ifconfig.me || true)
-[ -z "$IP" ] && IP=$(hostname -I | awk '{print $1}')
+IP=$(curl -s ifconfig.me || hostname -I | awk '{print $1}')
 
 echo "[+] Interface: $IFACE"
 echo "[+] IP: $IP"
 
-echo "[+] Configurando Easy-RSA..."
-make-cadir /etc/openvpn/easy-rsa
-cd /etc/openvpn/easy-rsa
+setup_server() {
+
+echo "[+] Configurando servidor..."
+
+make-cadir "$EASY" 2>/dev/null || true
+cd "$EASY"
 
 ./easyrsa init-pki
 echo | ./easyrsa build-ca nopass
+
 ./easyrsa gen-req server nopass
 echo yes | ./easyrsa sign-req server server
 ./easyrsa gen-dh
-
 openvpn --genkey --secret ta.key
 
-cp pki/ca.crt /etc/openvpn/
-cp pki/private/server.key /etc/openvpn/
-cp pki/issued/server.crt /etc/openvpn/
-cp pki/dh.pem /etc/openvpn/
-cp ta.key /etc/openvpn/
+mkdir -p "$BASE"
 
-echo "[+] Criando config do servidor..."
-cat > /etc/openvpn/server.conf <<EOF
+cp pki/ca.crt "$BASE/"
+cp pki/private/server.key "$BASE/"
+cp pki/issued/server.crt "$BASE/"
+cp pki/dh.pem "$BASE/"
+cp ta.key "$BASE/"
+
+cat > "$BASE/server.conf" <<EOF
 port 1194
 proto udp
 dev tun
@@ -48,79 +74,129 @@ dh dh.pem
 tls-auth ta.key 0
 
 server 10.8.0.0 255.255.255.0
-persist-key
-persist-tun
 
 push "redirect-gateway def1 bypass-dhcp"
 push "dhcp-option DNS 1.1.1.1"
 push "dhcp-option DNS 8.8.8.8"
 
 keepalive 10 120
-cipher AES-256-CBC
-
-status openvpn-status.log
+persist-key
+persist-tun
 verb 3
 EOF
 
-echo "[+] Ativando IP forward..."
 echo "net.ipv4.ip_forward=1" > /etc/sysctl.d/99-openvpn.conf
-sysctl -p /etc/sysctl.d/99-openvpn.conf
+sysctl -p >/dev/null 2>&1 || true
 
-echo "[+] Configurando NAT..."
-iptables -t nat -A POSTROUTING -o $IFACE -j MASQUERADE
+# NAT (iptables fallback)
+iptables -t nat -A POSTROUTING -o "$IFACE" -j MASQUERADE 2>/dev/null || true
 
-# Persistir iptables
-rc-update add iptables
-rc-service iptables save
+echo "[+] Servidor pronto"
+}
 
-echo "[+] Criando cliente..."
-cd /etc/openvpn/easy-rsa
-./easyrsa gen-req client nopass
-echo yes | ./easyrsa sign-req client client
+start_service() {
+if command -v systemctl >/dev/null 2>&1; then
+    systemctl enable openvpn-server@server
+    systemctl restart openvpn-server@server
+elif command -v rc-service >/dev/null 2>&1; then
+    rc-update add openvpn default
+    rc-service openvpn restart
+else
+    openvpn --config "$BASE/server.conf" &
+fi
+}
 
-CLIENT_OVPN=/root/client.ovpn
+create_client() {
 
-cat > $CLIENT_OVPN <<EOF
+read -p "Nome do cliente: " NAME
+
+cd "$EASY"
+
+./easyrsa gen-req "$NAME" nopass
+echo yes | ./easyrsa sign-req client "$NAME"
+
+OVPN="$CLIENTS/$NAME.ovpn"
+
+cat > "$OVPN" <<EOF
 client
 dev tun
 proto udp
 remote $IP 1194
-resolv-retry infinite
 nobind
 persist-key
 persist-tun
 remote-cert-tls server
-cipher AES-256-CBC
-key-direction 1
 verb 3
 
 <ca>
-$(cat /etc/openvpn/ca.crt)
+$(cat "$BASE/ca.crt")
 </ca>
 
 <cert>
-$(cat pki/issued/client.crt)
+$(cat "$PKI/issued/$NAME.crt")
 </cert>
 
 <key>
-$(cat pki/private/client.key)
+$(cat "$PKI/private/$NAME.key")
 </key>
 
 <tls-auth>
-$(cat /etc/openvpn/ta.key)
+$(cat "$BASE/ta.key")
 </tls-auth>
 EOF
 
-echo "[+] Iniciando OpenVPN..."
+echo "[+] Cliente criado: $OVPN"
 
-# OpenRC usa nome da config
-rc-service openvpn start || openvpn --config /etc/openvpn/server.conf &
+# QR Code
+echo "[+] Gerando QR Code..."
+qrencode -t ansiutf8 < "$OVPN"
 
-rc-update add openvpn
+}
 
+revoke_client() {
+read -p "Nome do cliente: " NAME
+
+cd "$EASY"
+./easyrsa revoke "$NAME"
+./easyrsa gen-crl
+
+echo "[+] Cliente revogado: $NAME"
+}
+
+list_clients() {
+echo "[+] Clientes:"
+ls "$CLIENTS" 2>/dev/null || echo "Nenhum cliente"
+}
+
+menu() {
+while true; do
 echo ""
-echo "===================================="
-echo "[✔] VPN PRONTA!"
-echo "Arquivo do cliente:"
-echo "$CLIENT_OVPN"
-echo "===================================="
+echo "========================="
+echo "   OPENVPN PANEL"
+echo "========================="
+echo "1) Criar cliente"
+echo "2) Revogar cliente"
+echo "3) Listar clientes"
+echo "4) Iniciar servidor"
+echo "5) Sair"
+echo "========================="
+read -p "Escolha: " opt
+
+case $opt in
+1) create_client ;;
+2) revoke_client ;;
+3) list_clients ;;
+4) start_service ;;
+5) exit 0 ;;
+*) echo "opção inválida" ;;
+esac
+done
+}
+
+# primeira instalação
+if [ ! -f "$BASE/server.conf" ]; then
+setup_server
+start_service
+fi
+
+menu
