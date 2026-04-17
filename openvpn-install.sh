@@ -4,14 +4,18 @@ set -e
 
 echo "[+] Instalando pacotes..."
 apk update
-apk add openvpn easy-rsa iptables curl
+apk add openvpn easy-rsa iptables iptables-openrc curl
 
 # Detectar interface automaticamente
-IFACE=$(ip route | grep default | awk '{print $5}')
-IP=$(curl -s ifconfig.me || hostname -I | awk '{print $1}')
+IFACE=$(ip route | awk '/default/ {print $5; exit}')
+[ -z "$IFACE" ] && IFACE="eth0"
 
-echo "[+] Interface detectada: $IFACE"
-echo "[+] IP detectado: $IP"
+# Detectar IP
+IP=$(curl -s ifconfig.me || true)
+[ -z "$IP" ] && IP=$(hostname -I | awk '{print $1}')
+
+echo "[+] Interface: $IFACE"
+echo "[+] IP: $IP"
 
 echo "[+] Configurando Easy-RSA..."
 make-cadir /etc/openvpn/easy-rsa
@@ -53,8 +57,6 @@ push "dhcp-option DNS 8.8.8.8"
 
 keepalive 10 120
 cipher AES-256-CBC
-user nobody
-group nobody
 
 status openvpn-status.log
 verb 3
@@ -67,8 +69,8 @@ sysctl -p /etc/sysctl.d/99-openvpn.conf
 echo "[+] Configurando NAT..."
 iptables -t nat -A POSTROUTING -o $IFACE -j MASQUERADE
 
-# Salvar regra NAT
-apk add iptables-save
+# Persistir iptables
+rc-update add iptables
 rc-service iptables save
 
 echo "[+] Criando cliente..."
@@ -110,7 +112,10 @@ $(cat /etc/openvpn/ta.key)
 EOF
 
 echo "[+] Iniciando OpenVPN..."
-rc-service openvpn start
+
+# OpenRC usa nome da config
+rc-service openvpn start || openvpn --config /etc/openvpn/server.conf &
+
 rc-update add openvpn
 
 echo ""
