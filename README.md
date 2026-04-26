@@ -3,8 +3,6 @@
 git clone https://github.com/aliendede1/Script-Linux
 cd Script-Linux
 chmod +x *.sh
-./install-apps.sh
-./dev_setup.sh
 ```
 
 ## Scripts Disponíveis
