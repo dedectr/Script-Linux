@@ -1,6 +1,6 @@
 
 ```bash
-git clone https://github.com/aliendede1/Script-Linux
+git clone https://github.com/dedectr/Script-Linux
 cd Script-Linux
 chmod +x *.sh
 ```
